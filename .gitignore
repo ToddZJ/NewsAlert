@@ -1,0 +1,11 @@
+.env
+*.log
+__pycache__/
+.idea/
+wxauto_logs/
+deliverables/
+*.pyc
+*.pyo
+*.pyd
+wxbot_state.json
+daily_digest_state.json
