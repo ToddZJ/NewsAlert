@@ -44,10 +44,22 @@ AKSHARE_NEWS_SOURCES=cls,sina,em,ths,futu
 python wxbot.py
 ```
 
+也可以直接双击启动：
+
+```text
+start_news_bot.bat
+```
+
 每日 GitHub + ClawHub 通报：
 
 ```powershell
 python daily_digest_bot.py
+```
+
+也可以直接双击启动：
+
+```text
+start_daily_digest.bat
 ```
 
 立刻试发一份：
