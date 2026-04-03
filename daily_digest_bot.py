@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import logging
 import os
@@ -58,6 +59,8 @@ OPENAI_HTTP_PROXY = os.getenv("OPENAI_HTTP_PROXY", "").strip()
 OPENAI_HTTPS_PROXY = os.getenv("OPENAI_HTTPS_PROXY", "").strip()
 OPENAI_NO_PROXY = os.getenv("OPENAI_NO_PROXY", "").strip()
 MAX_WECHAT_MESSAGE_LEN = int(os.getenv("MAX_WECHAT_MESSAGE_LEN", "1800"))
+WECHAT_SEND_MUTEX_NAME = os.getenv("WECHAT_SEND_MUTEX_NAME", "Global\\xinyuelib_wechat_send_mutex")
+WECHAT_SEND_LOCK_WAIT_SECONDS = int(os.getenv("WECHAT_SEND_LOCK_WAIT_SECONDS", "10"))
 
 
 logging.basicConfig(
@@ -145,6 +148,32 @@ class DailyDigestBot:
 
         raise RuntimeError(f"未能自动切换到目标群: {target_candidates}")
 
+    def _acquire_send_lock(self):
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.CreateMutexW(None, False, WECHAT_SEND_MUTEX_NAME)
+        if not handle:
+            raise ctypes.WinError()
+        wait_ms = max(1, WECHAT_SEND_LOCK_WAIT_SECONDS) * 1000
+        logger.info("等待微信发送锁: %s", WECHAT_SEND_MUTEX_NAME)
+        while True:
+            result = kernel32.WaitForSingleObject(handle, wait_ms)
+            if result in (0x00000000, 0x00000080):
+                logger.info("已获取微信发送锁: %s", WECHAT_SEND_MUTEX_NAME)
+                return handle
+            if result == 0x00000102:
+                logger.warning("微信发送锁等待超时，继续等待: %s", WECHAT_SEND_MUTEX_NAME)
+                continue
+            kernel32.CloseHandle(handle)
+            raise ctypes.WinError()
+
+    def _release_send_lock(self, handle) -> None:
+        kernel32 = ctypes.windll.kernel32
+        try:
+            kernel32.ReleaseMutex(handle)
+        finally:
+            kernel32.CloseHandle(handle)
+        logger.info("已释放微信发送锁: %s", WECHAT_SEND_MUTEX_NAME)
+
     def safe_send_msg(self, message: str, max_retries: int = 3) -> bool:
         if not self.wx:
             raise RuntimeError("微信实例未初始化")
@@ -152,25 +181,29 @@ class DailyDigestBot:
         chunks = split_message(message, MAX_WECHAT_MESSAGE_LEN)
         allowed_chats = {normalize_name(WECHAT_TARGET), *[normalize_name(x) for x in WECHAT_TARGET_ALIASES]}
 
-        for chunk in chunks:
-            sent = False
-            for attempt in range(1, max_retries + 1):
-                try:
-                    self.ensure_target_chat()
-                    current_chat = clean_text(self.wx.ChatInfo().get("chat_name"))
-                    if normalize_name(current_chat) not in allowed_chats:
-                        raise RuntimeError(f"当前聊天窗口不是目标群: {current_chat}")
-                    self.wx.SendMsg(msg=chunk)
-                    sent = True
-                    break
-                except Exception as exc:
-                    logger.error("发送日报失败(%s/%s): %s", attempt, max_retries, exc)
-                    if attempt < max_retries:
-                        time.sleep(2)
-            if not sent:
-                return False
-            time.sleep(0.8)
-        return True
+        lock_handle = self._acquire_send_lock()
+        try:
+            for chunk in chunks:
+                sent = False
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        self.ensure_target_chat()
+                        current_chat = clean_text(self.wx.ChatInfo().get("chat_name"))
+                        if normalize_name(current_chat) not in allowed_chats:
+                            raise RuntimeError(f"当前聊天窗口不是目标群: {current_chat}")
+                        self.wx.SendMsg(msg=chunk)
+                        sent = True
+                        break
+                    except Exception as exc:
+                        logger.error("发送日报失败(%s/%s): %s", attempt, max_retries, exc)
+                        if attempt < max_retries:
+                            time.sleep(2)
+                if not sent:
+                    return False
+                time.sleep(0.8)
+            return True
+        finally:
+            self._release_send_lock(lock_handle)
 
     def should_send_today(self, now: datetime | None = None) -> bool:
         now = now or datetime.now()
