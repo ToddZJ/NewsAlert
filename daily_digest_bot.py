@@ -486,8 +486,8 @@ def handle_exit(signum: int, frame: object) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--once", action="store_true", help="立刻生成并发送一份日报")
-    args = parser.parse_args()
+    parser.add_argument("--once", action="store_true", help="兼容参数：启动后只发送一次日报")
+    parser.parse_args()
 
     signal.signal(signal.SIGINT, handle_exit)
     signal.signal(signal.SIGTERM, handle_exit)
@@ -496,11 +496,8 @@ def main() -> None:
     if not bot.init_wechat():
         raise SystemExit("微信初始化失败，请确认桌面微信已登录并可见")
 
-    if args.once:
-        success = bot.send_digest()
-        raise SystemExit(0 if success else 1)
-
-    bot.run_forever()
+    success = bot.send_digest()
+    raise SystemExit(0 if success else 1)
 
 
 if __name__ == "__main__":

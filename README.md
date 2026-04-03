@@ -1,79 +1,81 @@
-# AKShare 多来源快讯 -> 微信群 HAO
+# NewsAlert
 
-这个脚本会每 150 秒拉取一次 AKShare 快讯接口，把程序启动时间之后的新消息整理后发到微信群 `HAO`。
+这个项目包含两个微信机器人：
 
-当前消息模板：
+- `wxbot.py`：3 秒轮询 AKShare 新闻并发送到 `HAO` 群
+- `daily_digest_bot.py`：每次启动生成一份 GitHub + ClawHub 日报并发送到 `HAO` 群
 
-```text
-市场热点
-1.  国内77家沥青企业产能利用率21.8%，环比降1.2%；
-2.  期货BU2606合约收盘4454，跌幅0.83%；
-3.  安徽某拌合站本周新增3万吨采购订单
-```
+## 新闻机器人
 
-说明：
-
-- 不输出时间
-- 不输出来源
-- 固定标题为 `市场热点`
-- 每条内容按编号列表输出
-
-支持的资讯源：
-
-- `cls`: 财联社快讯 `stock_info_global_cls`
-- `sina`: 新浪财经全球快讯 `stock_info_global_sina`
-- `em`: 东方财富资讯 `stock_info_global_em`
-- `ths`: 同花顺资讯 `stock_info_global_ths`
-- `futu`: 富途快讯 `stock_info_global_futu`
-
-默认启用：
-
-```env
-AKSHARE_NEWS_SOURCES=cls,sina
-```
-
-如果想继续加来源，可以改成：
-
-```env
-AKSHARE_NEWS_SOURCES=cls,sina,em,ths,futu
-```
-
-运行：
+启动：
 
 ```powershell
 python wxbot.py
 ```
 
-也可以直接双击启动：
+或直接双击：
 
 ```text
 start_news_bot.bat
 ```
 
-每日 GitHub + ClawHub 通报：
+当前新闻模板：
+
+```text
+市场热点
+1.  内容一；
+2.  内容二；
+3.  内容三
+```
+
+## 每日日报机器人
+
+启动：
 
 ```powershell
 python daily_digest_bot.py
 ```
 
-也可以直接双击启动：
+或直接双击：
 
 ```text
 start_daily_digest.bat
 ```
 
-立刻试发一份：
+当前行为：
+
+- 每次启动 `daily_digest_bot.py`，就生成并发送一次日报
+- 发送完成后直接退出
+- `--once` 仍可用，但只是兼容参数
+
+手动试发：
 
 ```powershell
 python daily_digest_bot.py --once
 ```
 
-默认会在每天 `09:00` 发送到 `HAO` 群，配置项在 [`.env`](C:\Users\panjiayuan\Documents\New project\.env)：
+## 主要配置
+
+配置文件：
+
+```text
+.env
+```
+
+常用项：
 
 ```env
+WECHAT_TARGET=HAO
+POLL_INTERVAL_SECONDS=3
+NEWS_HISTORY_LIMIT=100
+
 DAILY_DIGEST_TARGET=HAO
-DAILY_REPORT_TIME=09:00
 GITHUB_TOP_N=5
 CLAWHUB_TOP_N=5
 CLAWHUB_TOPIC_QUERIES=agent,github,search,automation,news,wechat
 ```
+
+## 启动脚本
+
+- `start_news_bot.bat`
+- `start_daily_digest.bat`
