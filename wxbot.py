@@ -8,6 +8,7 @@ import re
 import signal
 import sys
 import time
+import ctypes
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -49,6 +50,8 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 OPENAI_TIMEOUT_SECONDS = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "60"))
 OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
 MAX_WECHAT_MESSAGE_LEN = int(os.getenv("MAX_WECHAT_MESSAGE_LEN", "1800"))
+WECHAT_SEND_MUTEX_NAME = os.getenv("WECHAT_SEND_MUTEX_NAME", "Global\\xinyuelib_wechat_send_mutex")
+WECHAT_SEND_LOCK_WAIT_SECONDS = int(os.getenv("WECHAT_SEND_LOCK_WAIT_SECONDS", "10"))
 OPENAI_HTTP_PROXY = os.getenv("OPENAI_HTTP_PROXY", "").strip()
 OPENAI_HTTPS_PROXY = os.getenv("OPENAI_HTTPS_PROXY", "").strip()
 OPENAI_NO_PROXY = os.getenv("OPENAI_NO_PROXY", "").strip()
@@ -79,6 +82,11 @@ class NewsItem:
     def fingerprint(self) -> str:
         raw = f"{self.channel}|{self.published_at.isoformat()}|{self.title}|{self.content}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @property
+    def dedupe_key(self) -> str:
+        normalized = canonicalize_news_text(self.title, self.content)
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
     def to_prompt_dict(self) -> dict[str, str]:
         return {
@@ -204,31 +212,62 @@ class MarketNewsBot:
                 deduped.append(name)
                 seen.add(name)
         return deduped
+
+    def _acquire_send_lock(self):
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.CreateMutexW(None, False, WECHAT_SEND_MUTEX_NAME)
+        if not handle:
+            raise ctypes.WinError()
+        wait_ms = max(1, WECHAT_SEND_LOCK_WAIT_SECONDS) * 1000
+        logger.info("等待微信发送锁: %s", WECHAT_SEND_MUTEX_NAME)
+        while True:
+            result = kernel32.WaitForSingleObject(handle, wait_ms)
+            if result in (0x00000000, 0x00000080):
+                logger.info("已获取微信发送锁: %s", WECHAT_SEND_MUTEX_NAME)
+                return handle
+            if result == 0x00000102:
+                logger.warning("微信发送锁等待超时，继续等待: %s", WECHAT_SEND_MUTEX_NAME)
+                continue
+            kernel32.CloseHandle(handle)
+            raise ctypes.WinError()
+
+    def _release_send_lock(self, handle) -> None:
+        kernel32 = ctypes.windll.kernel32
+        try:
+            kernel32.ReleaseMutex(handle)
+        finally:
+            kernel32.CloseHandle(handle)
+        logger.info("已释放微信发送锁: %s", WECHAT_SEND_MUTEX_NAME)
+
     def safe_send_msg(self, message: str, max_retries: int = 3) -> bool:
         if not self.wx:
             raise RuntimeError("微信实例未初始化")
 
         allowed_chats = {normalize_name(WECHAT_TARGET), *[normalize_name(x) for x in WECHAT_TARGET_ALIASES]}
         chunks = split_message(message, MAX_WECHAT_MESSAGE_LEN)
-        for chunk in chunks:
-            sent = False
-            for attempt in range(1, max_retries + 1):
-                try:
-                    self.ensure_target_chat()
-                    current_chat = clean_text(self.wx.ChatInfo().get("chat_name"))
-                    if normalize_name(current_chat) not in allowed_chats:
-                        raise RuntimeError(f"当前聊天窗口不是目标群: {current_chat}")
-                    self.wx.SendMsg(msg=chunk)
-                    sent = True
-                    break
-                except Exception as exc:
-                    logger.error("发送微信消息失败(%s/%s): %s", attempt, max_retries, exc)
-                    if attempt < max_retries:
-                        time.sleep(2)
-            if not sent:
-                return False
-            time.sleep(0.8)
-        return True
+        lock_handle = self._acquire_send_lock()
+        try:
+            for chunk in chunks:
+                sent = False
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        self.ensure_target_chat()
+                        current_chat = clean_text(self.wx.ChatInfo().get("chat_name"))
+                        if normalize_name(current_chat) not in allowed_chats:
+                            raise RuntimeError(f"当前聊天窗口不是目标群: {current_chat}")
+                        self.wx.SendMsg(msg=chunk)
+                        sent = True
+                        break
+                    except Exception as exc:
+                        logger.error("发送微信消息失败(%s/%s): %s", attempt, max_retries, exc)
+                        if attempt < max_retries:
+                            time.sleep(2)
+                if not sent:
+                    return False
+                time.sleep(0.8)
+            return True
+        finally:
+            self._release_send_lock(lock_handle)
 
     def fetch_news(self) -> list[NewsItem]:
         try:
@@ -266,7 +305,7 @@ class MarketNewsBot:
         for item in items:
             if item.published_at < self.started_at:
                 continue
-            if item.fingerprint in self.recent_fingerprint_set:
+            if item.dedupe_key in self.recent_fingerprint_set:
                 continue
             new_items.append(item)
         return new_items
@@ -288,14 +327,15 @@ class MarketNewsBot:
             "市场热点\n"
             "1. 句子；\n"
             "2. 句子；\n"
-            "3. 句子\n\n"
+            "...\n\n"
             "要求：\n"
             "1. 不要输出时间、信息源、标题、前言、结语、Markdown。\n"
             "2. 每条只保留核心信息，写成一句话。\n"
             "3. 重复或高度相似内容要合并。\n"
             "4. 保持中文全角分号风格，最后一条可以不加分号。\n"
-            "5. 如果只有一条或两条，也保持同样结构。\n"
-            "6. 只基于输入内容总结，不能增加未出现的信息。"
+            "5. 条数由实际有效热点数量决定，不要强行凑成 3 条。\n"
+            "6. 如果只有一条或两条，也保持同样结构。\n"
+            "7. 只基于输入内容总结，不能增加未出现的信息。"
         )
         user_prompt = json.dumps(
             [item.to_prompt_dict() for item in deduped_items],
@@ -311,10 +351,10 @@ class MarketNewsBot:
 
     def mark_sent(self, items: Iterable[NewsItem]) -> None:
         for item in items:
-            if item.fingerprint in self.recent_fingerprint_set:
+            if item.dedupe_key in self.recent_fingerprint_set:
                 continue
-            self.recent_fingerprint_set.add(item.fingerprint)
-            self.recent_fingerprints.append(item.fingerprint)
+            self.recent_fingerprint_set.add(item.dedupe_key)
+            self.recent_fingerprints.append(item.dedupe_key)
         if len(self.recent_fingerprints) > NEWS_HISTORY_LIMIT:
             self.recent_fingerprints = self.recent_fingerprints[-NEWS_HISTORY_LIMIT:]
             self.recent_fingerprint_set = set(self.recent_fingerprints)
@@ -420,15 +460,49 @@ def infer_source(title_value: object, content_value: object, default_source: str
 
 
 def dedupe_exact(items: list[NewsItem]) -> list[NewsItem]:
-    seen: set[str] = set()
+    seen: list[str] = []
     result: list[NewsItem] = []
     for item in items:
-        key = hashlib.sha256(f"{item.title}|{item.content}".encode("utf-8")).hexdigest()
-        if key in seen:
+        normalized = canonicalize_news_text(item.title, item.content)
+        if not normalized:
             continue
-        seen.add(key)
+        duplicated = False
+        for existing in seen:
+            if is_near_duplicate(normalized, existing):
+                duplicated = True
+                break
+        if duplicated:
+            continue
+        seen.append(normalized)
         result.append(item)
     return result
+
+
+def canonicalize_news_text(title: str, content: str) -> str:
+    text = clean_text(content or title or "")
+    text = re.sub(r"^[【\[].*?[】\]]", "", text)
+    text = re.sub(r"^(财联社|新浪财经|东方财富|同花顺|富途)[0-9月日:\- ]*电[，,：:]?", "", text)
+    text = re.sub(r"\([^)]{2,20}\)$", "", text)
+    text = re.sub(r"[（(][^()（）]{2,20}[）)]$", "", text)
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[，,。；;：:！!？?\-—_、\"'“”‘’\[\]【】()（）]", "", text)
+    return text.strip().lower()
+
+
+def is_near_duplicate(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if left in right or right in left:
+        shorter = min(len(left), len(right))
+        longer = max(len(left), len(right))
+        if shorter >= 12 and shorter / max(longer, 1) >= 0.7:
+            return True
+    left_bigrams = {left[i : i + 2] for i in range(max(len(left) - 1, 0))}
+    right_bigrams = {right[i : i + 2] for i in range(max(len(right) - 1, 0))}
+    if not left_bigrams or not right_bigrams:
+        return False
+    overlap = len(left_bigrams & right_bigrams) / max(min(len(left_bigrams), len(right_bigrams)), 1)
+    return overlap >= 0.82
 
 
 def render_fallback_message(items: list[NewsItem]) -> str:
