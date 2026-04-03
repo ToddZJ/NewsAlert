@@ -38,7 +38,7 @@ WECHAT_TARGET_ALIASES = [
 AKSHARE_SYMBOL = os.getenv("AKSHARE_SYMBOL", "全部")
 AKSHARE_NEWS_SOURCES = [
     item.strip().lower()
-    for item in os.getenv("AKSHARE_NEWS_SOURCES", "cls,sina").split(",")
+    for item in os.getenv("AKSHARE_NEWS_SOURCES", "cls,sina,futu,em,ths,cx").split(",")
     if item.strip()
 ]
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "3"))
@@ -242,6 +242,7 @@ class MarketNewsBot:
             "em": lambda: fetch_em_news(ak),
             "ths": lambda: fetch_ths_news(ak),
             "futu": lambda: fetch_futu_news(ak),
+            "cx": lambda: fetch_cx_news(ak),
         }
 
         items: list[NewsItem] = []
@@ -665,6 +666,32 @@ def fetch_futu_news(ak: object) -> list[NewsItem]:
                 source=infer_source(title, content, "富途"),
                 channel="富途",
                 link=clean_text(row.get("链接")),
+            )
+        )
+    return items
+
+
+def fetch_cx_news(ak: object) -> list[NewsItem]:
+    df = ak.stock_news_main_cx()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+    items: list[NewsItem] = []
+    fetched_at = datetime.now()
+    for row in df.to_dict("records"):
+        tag = clean_text(row.get("tag"))
+        summary = clean_text(row.get("summary"))
+        if not summary:
+            continue
+        title = tag
+        content = summary if not tag else f"{tag}：{summary}"
+        items.append(
+            NewsItem(
+                title=title,
+                content=content,
+                published_at=fetched_at,
+                source="财新精选",
+                channel="财新精选",
+                link=clean_text(row.get("url")),
             )
         )
     return items
