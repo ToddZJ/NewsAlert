@@ -16,6 +16,10 @@ from typing import Iterable
 
 import pandas as pd
 import requests
+import win32api
+import win32con
+import win32gui
+import win32process
 from dateutil import parser as date_parser
 from dotenv import load_dotenv
 from requests import RequestException
@@ -42,7 +46,8 @@ AKSHARE_NEWS_SOURCES = [
     for item in os.getenv("AKSHARE_NEWS_SOURCES", "cls,sina,futu,em,ths,cx").split(",")
     if item.strip()
 ]
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "3"))
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
+LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "6"))
 NEWS_HISTORY_LIMIT = int(os.getenv("NEWS_HISTORY_LIMIT", "500"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.siliconflow.cn/v1").rstrip("/")
@@ -103,17 +108,22 @@ class MarketNewsBot:
     def __init__(self) -> None:
         self.wx: WeChat | None = None
         self.started_at = STARTED_AT
-        self.recent_fingerprints = self._load_state()
-        self.recent_fingerprint_set = set(self.recent_fingerprints)
+        legacy_keys = self._load_state_keys("recent_fingerprints", "sent_fingerprints")
+        self.pulled_keys = self._load_state_keys("pulled_fingerprints") or legacy_keys
+        self.modeled_keys = self._load_state_keys("modeled_fingerprints") or legacy_keys
+        self.sent_keys = self._load_state_keys("sent_fingerprints") or legacy_keys
+        self.pulled_key_set = set(self.pulled_keys)
+        self.modeled_key_set = set(self.modeled_keys)
+        self.sent_key_set = set(self.sent_keys)
 
-    def _load_state(self) -> list[str]:
+    def _load_state_keys(self, primary_key: str, fallback_key: str | None = None) -> list[str]:
         if not STATE_FILE.exists():
             return []
         try:
             payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            hashes = payload.get("recent_fingerprints")
-            if hashes is None:
-                hashes = payload.get("sent_fingerprints", [])
+            hashes = payload.get(primary_key)
+            if hashes is None and fallback_key:
+                hashes = payload.get(fallback_key, [])
             if isinstance(hashes, list):
                 cleaned = [str(item) for item in hashes if str(item).strip()]
                 return cleaned[-NEWS_HISTORY_LIMIT:]
@@ -124,7 +134,9 @@ class MarketNewsBot:
     def _save_state(self) -> None:
         payload = {
             "started_at": self.started_at.strftime("%Y-%m-%d %H:%M:%S"),
-            "recent_fingerprints": self.recent_fingerprints[-NEWS_HISTORY_LIMIT:],
+            "pulled_fingerprints": self.pulled_keys[-NEWS_HISTORY_LIMIT:],
+            "modeled_fingerprints": self.modeled_keys[-NEWS_HISTORY_LIMIT:],
+            "sent_fingerprints": self.sent_keys[-NEWS_HISTORY_LIMIT:],
         }
         STATE_FILE.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -154,6 +166,7 @@ class MarketNewsBot:
             for exact, force in ((True, False), (False, False), (False, True), (True, True)):
                 tried.append(f"{target}|exact={exact}|force={force}")
                 try:
+                    activate_wechat_window()
                     self.wx.ChatWith(who=target, exact=exact, force=force, force_wait=0.8)
                     time.sleep(0.8)
                     current_chat = clean_text(self.wx.ChatInfo().get("chat_name"))
@@ -168,6 +181,7 @@ class MarketNewsBot:
             normalized_session = normalize_name(session_name)
             if any(target and target in normalized_session for target in normalized_targets):
                 try:
+                    activate_wechat_window()
                     self.wx.ChatWith(who=session_name, exact=True, force=True, force_wait=0.8)
                     time.sleep(0.8)
                     current_chat = clean_text(self.wx.ChatInfo().get("chat_name"))
@@ -300,24 +314,38 @@ class MarketNewsBot:
         items.sort(key=lambda item: item.published_at)
         return items
 
-    def filter_new_items(self, items: Iterable[NewsItem]) -> list[NewsItem]:
-        new_items: list[NewsItem] = []
+    def filter_recent_window_items(self, items: Iterable[NewsItem]) -> list[NewsItem]:
+        window_items: list[NewsItem] = []
+        cutoff_time = datetime.now() - timedelta(minutes=LOOKBACK_MINUTES)
         for item in items:
-            if item.published_at < self.started_at:
+            if item.published_at < cutoff_time:
                 continue
-            if item.dedupe_key in self.recent_fingerprint_set:
+            window_items.append(item)
+        return window_items
+
+    def filter_unpulled_items(self, items: Iterable[NewsItem]) -> list[NewsItem]:
+        result: list[NewsItem] = []
+        for item in items:
+            if item.dedupe_key in self.pulled_key_set:
                 continue
-            new_items.append(item)
-        return new_items
+            result.append(item)
+        return result
+
+    def filter_unmodeled_items(self, items: Iterable[NewsItem]) -> list[NewsItem]:
+        result: list[NewsItem] = []
+        for item in items:
+            if item.dedupe_key in self.modeled_key_set:
+                continue
+            result.append(item)
+        return result
 
     def summarize_batch(self, items: list[NewsItem]) -> str:
         if not items:
             return ""
 
-        deduped_items = dedupe_exact(items)
         if not OPENAI_API_KEY:
             logger.warning("未配置 OPENAI_API_KEY，使用本地降级格式化")
-            return render_fallback_message(deduped_items)
+            return render_fallback_message(items)
 
         system_prompt = (
             "你是市场资讯整理助手。"
@@ -338,7 +366,7 @@ class MarketNewsBot:
             "7. 只基于输入内容总结，不能增加未出现的信息。"
         )
         user_prompt = json.dumps(
-            [item.to_prompt_dict() for item in deduped_items],
+            [item.to_prompt_dict() for item in items],
             ensure_ascii=False,
             indent=2,
         )
@@ -346,35 +374,63 @@ class MarketNewsBot:
             response_text = call_openai_chat(system_prompt=system_prompt, user_prompt=user_prompt)
         except Exception as exc:
             logger.warning("大模型总结失败，回退到本地格式化发送: %s", exc)
-            return render_fallback_message(deduped_items)
-        return response_text.strip() if response_text.strip() else render_fallback_message(deduped_items)
+            return render_fallback_message(items)
+        return response_text.strip() if response_text.strip() else render_fallback_message(items)
+
+    def _append_state_keys(self, items: Iterable[NewsItem], key_set: set[str], key_list: list[str]) -> None:
+        for item in items:
+            if item.dedupe_key in key_set:
+                continue
+            key_set.add(item.dedupe_key)
+            key_list.append(item.dedupe_key)
+        if len(key_list) > NEWS_HISTORY_LIMIT:
+            del key_list[:-NEWS_HISTORY_LIMIT]
+            key_set.clear()
+            key_set.update(key_list)
+
+    def mark_pulled(self, items: Iterable[NewsItem]) -> None:
+        self._append_state_keys(items, self.pulled_key_set, self.pulled_keys)
+        self._save_state()
+
+    def mark_modeled(self, items: Iterable[NewsItem]) -> None:
+        self._append_state_keys(items, self.modeled_key_set, self.modeled_keys)
+        self._save_state()
 
     def mark_sent(self, items: Iterable[NewsItem]) -> None:
-        for item in items:
-            if item.dedupe_key in self.recent_fingerprint_set:
-                continue
-            self.recent_fingerprint_set.add(item.dedupe_key)
-            self.recent_fingerprints.append(item.dedupe_key)
-        if len(self.recent_fingerprints) > NEWS_HISTORY_LIMIT:
-            self.recent_fingerprints = self.recent_fingerprints[-NEWS_HISTORY_LIMIT:]
-            self.recent_fingerprint_set = set(self.recent_fingerprints)
+        self._append_state_keys(items, self.sent_key_set, self.sent_keys)
         self._save_state()
 
     def run_once(self) -> None:
         items = self.fetch_news()
-        new_items = self.filter_new_items(items)
-        if not new_items:
-            logger.info("本轮没有启动时间之后的新快讯")
+        raw_count = len(items)
+        window_items = self.filter_recent_window_items(items)
+        window_count = len(window_items)
+        pulled_new_items = self.filter_unpulled_items(window_items)
+        self.mark_pulled(pulled_new_items)
+        to_model_items = self.filter_unmodeled_items(pulled_new_items)
+        deduped_for_model = dedupe_exact(to_model_items)
+
+        logger.info(
+            "本轮统计: 原始抓取数=%s / 窗口过滤后数=%s / 待模型数=%s / 去重后数=%s",
+            raw_count,
+            window_count,
+            len(to_model_items),
+            len(deduped_for_model),
+        )
+
+        if not deduped_for_model:
+            logger.info("本轮最近 %s 分钟内无新快讯", LOOKBACK_MINUTES)
             return
 
-        logger.info("本轮抓到 %s 条新快讯，开始总结并发送", len(new_items))
-        message = self.summarize_batch(new_items)
+        logger.info("本轮抓到 %s 条新快讯，开始总结并发送", len(deduped_for_model))
+        message = self.summarize_batch(deduped_for_model)
         if not message:
             logger.warning("模型未返回可发送内容，本轮跳过")
             return
 
+        self.mark_modeled(deduped_for_model)
         if self.safe_send_msg(message):
-            self.mark_sent(new_items)
+            self.mark_sent(deduped_for_model)
             logger.info("本轮发送完成")
         else:
             logger.error("本轮发送失败，未写入已发送状态")
@@ -385,6 +441,7 @@ class MarketNewsBot:
         if WECHAT_TARGET_ALIASES:
             logger.info("目标群别名: %s", WECHAT_TARGET_ALIASES)
         logger.info("资讯源: %s", AKSHARE_NEWS_SOURCES)
+        logger.info("新闻抓取时间窗口: 最近 %s 分钟", LOOKBACK_MINUTES)
         logger.info("轮询间隔: %s 秒", POLL_INTERVAL_SECONDS)
         logger.info("新闻去重历史容量: %s", NEWS_HISTORY_LIMIT)
         logger.info("OpenAI Base URL: %s", OPENAI_BASE_URL)
@@ -408,6 +465,60 @@ def clean_text(value: object) -> str:
 
 def normalize_name(value: str) -> str:
     return re.sub(r"\s+", "", clean_text(value)).lower()
+
+
+def find_wechat_window() -> int | None:
+    matches: list[int] = []
+
+    def callback(hwnd: int, _: object) -> None:
+        if not win32gui.IsWindowVisible(hwnd):
+            return
+        title = clean_text(win32gui.GetWindowText(hwnd))
+        if title == "微信":
+            matches.append(hwnd)
+
+    win32gui.EnumWindows(callback, None)
+    return matches[0] if matches else None
+
+
+def activate_wechat_window() -> None:
+    hwnd = find_wechat_window()
+    if not hwnd:
+        return
+
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        else:
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+        win32gui.BringWindowToTop(hwnd)
+        force_set_foreground_window(hwnd)
+        time.sleep(0.3)
+    except Exception as exc:
+        logger.warning("激活微信窗口失败: %s", exc)
+
+
+def force_set_foreground_window(hwnd: int) -> None:
+    user32 = ctypes.windll.user32
+    current_foreground = user32.GetForegroundWindow()
+    current_thread = user32.GetWindowThreadProcessId(current_foreground, None)
+    target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+    this_thread = win32api.GetCurrentThreadId()
+
+    attached_threads: list[tuple[int, int]] = []
+    for src, dst in ((this_thread, target_thread), (this_thread, current_thread), (current_thread, target_thread)):
+        if src and dst and src != dst:
+            user32.AttachThreadInput(src, dst, True)
+            attached_threads.append((src, dst))
+
+    try:
+        user32.AllowSetForegroundWindow(-1)
+        win32gui.SetForegroundWindow(hwnd)
+        win32gui.SetActiveWindow(hwnd)
+        win32gui.SetFocus(hwnd)
+    finally:
+        for src, dst in reversed(attached_threads):
+            user32.AttachThreadInput(src, dst, False)
 
 
 def parse_news_datetime(date_value: object, time_value: object | None = None) -> datetime | None:
