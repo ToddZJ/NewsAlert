@@ -377,6 +377,65 @@ class MarketNewsBot:
             return render_fallback_message(items)
         return response_text.strip() if response_text.strip() else render_fallback_message(items)
 
+    def summarize_batch_v2(self, items: list[NewsItem]) -> str:
+        if not items:
+            return ""
+
+        target_items = items[:12]
+        target_count = len(target_items)
+
+        if not OPENAI_API_KEY:
+            logger.warning("未配置 OPENAI_API_KEY，使用本地降级格式化")
+            return render_fallback_message(target_items)
+
+        system_prompt = (
+            "你是市场资讯整理助手。"
+            "请对输入的快讯做语义去重、合并相同事件、压缩措辞，但绝不编造事实。"
+            "输出必须是简体中文纯文本，适合直接发微信群。"
+            "输出格式必须严格如下：\n"
+            "市场热点\n"
+            "1. 句子；\n"
+            "2. 句子；\n"
+            "...\n\n"
+            "要求：\n"
+            "1. 不要输出时间、信息源、标题、前言、结语、Markdown。\n"
+            "2. 每条只保留核心信息，写成一句话。\n"
+            "3. 重复或高度相似内容要合并。\n"
+            "4. 保持中文全角分号风格，最后一条可以不加分号。\n"
+            "5. 条数按有效热点数量决定，不要强行凑成 3 条。\n"
+            "6. 只基于输入内容总结，不能增加未出现的信息。\n"
+            "7. 必须输出编号条数=指定条数，不多不少。"
+        )
+        user_prompt = json.dumps(
+            {
+                "target_count": target_count,
+                "instruction": f"请严格输出 {target_count} 条，每条一句话。",
+                "items": [item.to_prompt_dict() for item in target_items],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+        try:
+            response_text = call_openai_chat(system_prompt=system_prompt, user_prompt=user_prompt)
+        except Exception as exc:
+            logger.warning("大模型总结失败，回退到本地格式化发送: %s", exc)
+            return render_fallback_message(target_items)
+
+        final_text = normalize_summary_text(response_text.strip())
+        if not final_text:
+            return render_fallback_message(target_items)
+
+        numbered_count = count_numbered_lines(final_text)
+        if numbered_count == 0 or numbered_count > target_count:
+            logger.warning(
+                "模型输出条数异常: target=%s, actual=%s，回退到本地格式化",
+                target_count,
+                numbered_count,
+            )
+            return render_fallback_message(target_items)
+        return final_text
+
     def _append_state_keys(self, items: Iterable[NewsItem], key_set: set[str], key_list: list[str]) -> None:
         for item in items:
             if item.dedupe_key in key_set:
@@ -423,7 +482,7 @@ class MarketNewsBot:
             return
 
         logger.info("本轮抓到 %s 条新快讯，开始总结并发送", len(deduped_for_model))
-        message = self.summarize_batch(deduped_for_model)
+        message = self.summarize_batch_v2(deduped_for_model)
         if not message:
             logger.warning("模型未返回可发送内容，本轮跳过")
             return
@@ -624,6 +683,23 @@ def render_fallback_message(items: list[NewsItem]) -> str:
         suffix = "；" if index < len(items) else ""
         lines.append(f"{index}.  {content}{suffix}")
     return "\n".join(lines).strip()
+
+
+def count_numbered_lines(text: str) -> int:
+    return sum(1 for line in text.splitlines() if re.match(r"^\s*\d+\.\s+", line))
+
+
+def normalize_summary_text(text: str) -> str:
+    if not text:
+        return ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    numbered = [line for line in lines if re.match(r"^\d+\.\s+", line)]
+    if not numbered:
+        return text.strip()
+    numbered = [line for line in numbered if "已合并" not in line and "重复" not in line]
+    if not numbered:
+        return ""
+    return "\n".join(["市场热点", *numbered]).strip()
 
 
 def strip_trailing_punctuation(text: str) -> str:
