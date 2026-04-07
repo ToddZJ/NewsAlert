@@ -381,7 +381,7 @@ class MarketNewsBot:
         if not items:
             return ""
 
-        target_items = items[:12]
+        target_items = items[:20]
         target_count = len(target_items)
 
         if not OPENAI_API_KEY:
