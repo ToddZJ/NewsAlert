@@ -9,6 +9,7 @@ import signal
 import sys
 import time
 import ctypes
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -53,8 +54,12 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.siliconflow.cn/v1").rstrip("/")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 OPENAI_TIMEOUT_SECONDS = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "60"))
+OPENAI_CONNECT_TIMEOUT_SECONDS = int(os.getenv("OPENAI_CONNECT_TIMEOUT_SECONDS", "15"))
+OPENAI_READ_TIMEOUT_SECONDS = int(os.getenv("OPENAI_READ_TIMEOUT_SECONDS", str(OPENAI_TIMEOUT_SECONDS)))
 OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
 MAX_WECHAT_MESSAGE_LEN = int(os.getenv("MAX_WECHAT_MESSAGE_LEN", "1800"))
+SUMMARY_BATCH_SIZE = int(os.getenv("SUMMARY_BATCH_SIZE", "8"))
+SUMMARY_MAX_ITEMS = int(os.getenv("SUMMARY_MAX_ITEMS", "0"))
 WECHAT_SEND_MUTEX_NAME = os.getenv("WECHAT_SEND_MUTEX_NAME", "Global\\xinyuelib_wechat_send_mutex")
 WECHAT_SEND_LOCK_WAIT_SECONDS = int(os.getenv("WECHAT_SEND_LOCK_WAIT_SECONDS", "10"))
 OPENAI_HTTP_PROXY = os.getenv("OPENAI_HTTP_PROXY", "").strip()
@@ -258,7 +263,7 @@ class MarketNewsBot:
             raise RuntimeError("微信实例未初始化")
 
         allowed_chats = {normalize_name(WECHAT_TARGET), *[normalize_name(x) for x in WECHAT_TARGET_ALIASES]}
-        chunks = split_message(message, MAX_WECHAT_MESSAGE_LEN)
+        chunks = split_message(sanitize_wechat_message(message), MAX_WECHAT_MESSAGE_LEN)
         lock_handle = self._acquire_send_lock()
         try:
             for chunk in chunks:
@@ -326,7 +331,7 @@ class MarketNewsBot:
     def filter_unpulled_items(self, items: Iterable[NewsItem]) -> list[NewsItem]:
         result: list[NewsItem] = []
         for item in items:
-            if item.dedupe_key in self.pulled_key_set:
+            if item.fingerprint in self.pulled_key_set:
                 continue
             result.append(item)
         return result
@@ -334,7 +339,7 @@ class MarketNewsBot:
     def filter_unmodeled_items(self, items: Iterable[NewsItem]) -> list[NewsItem]:
         result: list[NewsItem] = []
         for item in items:
-            if item.dedupe_key in self.modeled_key_set:
+            if item.fingerprint in self.modeled_key_set:
                 continue
             result.append(item)
         return result
@@ -381,7 +386,7 @@ class MarketNewsBot:
         if not items:
             return ""
 
-        target_items = items[:20]
+        target_items = items if SUMMARY_MAX_ITEMS <= 0 else items[:SUMMARY_MAX_ITEMS]
         target_count = len(target_items)
 
         if not OPENAI_API_KEY:
@@ -422,7 +427,7 @@ class MarketNewsBot:
             logger.warning("大模型总结失败，回退到本地格式化发送: %s", exc)
             return render_fallback_message(target_items)
 
-        final_text = normalize_summary_text(response_text.strip())
+        final_text = normalize_summary_text_v2(response_text.strip())
         if not final_text:
             return render_fallback_message(target_items)
 
@@ -434,29 +439,83 @@ class MarketNewsBot:
                 numbered_count,
             )
             return render_fallback_message(target_items)
-        return final_text
+        return sanitize_wechat_message(final_text)
 
-    def _append_state_keys(self, items: Iterable[NewsItem], key_set: set[str], key_list: list[str]) -> None:
+    def _append_state_keys(
+        self,
+        items: Iterable[NewsItem],
+        key_set: set[str],
+        key_list: list[str],
+        key_attr: str,
+    ) -> None:
         for item in items:
-            if item.dedupe_key in key_set:
+            key_value = getattr(item, key_attr, "")
+            if not key_value:
                 continue
-            key_set.add(item.dedupe_key)
-            key_list.append(item.dedupe_key)
+            if key_value in key_set:
+                continue
+            key_set.add(key_value)
+            key_list.append(key_value)
         if len(key_list) > NEWS_HISTORY_LIMIT:
             del key_list[:-NEWS_HISTORY_LIMIT]
             key_set.clear()
             key_set.update(key_list)
 
+    def summarize_batch_v3(self, items: list[NewsItem]) -> str:
+        if not items:
+            return ""
+
+        target_items = items[:20]
+        if not OPENAI_API_KEY:
+            logger.warning("未配置 OPENAI_API_KEY，使用本地降级格式化")
+            return render_fallback_message(target_items)
+
+        batch_sizes: list[int] = []
+        for candidate in (SUMMARY_BATCH_SIZE, max(4, SUMMARY_BATCH_SIZE // 2), 2):
+            if candidate not in batch_sizes:
+                batch_sizes.append(candidate)
+
+        last_error: Exception | None = None
+        for batch_size in batch_sizes:
+            try:
+                return self._summarize_batch_with_chunking(target_items, batch_size)
+            except Exception as exc:
+                last_error = exc
+                logger.warning("大模型总结失败，改用更小批次重试: batch_size=%s, error=%s", batch_size, exc)
+
+        logger.warning("大模型总结失败，回退到本地格式化发送: %s", last_error)
+        return render_fallback_message(target_items)
+
+    def _summarize_batch_with_chunking(self, items: list[NewsItem], batch_size: int) -> str:
+        lines: list[str] = []
+        for start in range(0, len(items), batch_size):
+            chunk = items[start : start + batch_size]
+            response_text = call_openai_chat(
+                system_prompt=build_summary_system_prompt(),
+                user_prompt=build_summary_user_prompt(chunk),
+            )
+            normalized = normalize_summary_text_v2(response_text.strip())
+            if not normalized:
+                continue
+            lines.extend(extract_numbered_bodies(normalized))
+
+        merged_lines = dedupe_summary_lines(lines)[: len(items)]
+        if not merged_lines:
+            raise RuntimeError("模型未返回可用摘要内容")
+        final_text = "\n".join(["市场热点", *[f"{idx}. {line}" for idx, line in enumerate(merged_lines, start=1)]])
+        return sanitize_wechat_message(final_text)
+
+
     def mark_pulled(self, items: Iterable[NewsItem]) -> None:
-        self._append_state_keys(items, self.pulled_key_set, self.pulled_keys)
+        self._append_state_keys(items, self.pulled_key_set, self.pulled_keys, "fingerprint")
         self._save_state()
 
     def mark_modeled(self, items: Iterable[NewsItem]) -> None:
-        self._append_state_keys(items, self.modeled_key_set, self.modeled_keys)
+        self._append_state_keys(items, self.modeled_key_set, self.modeled_keys, "fingerprint")
         self._save_state()
 
     def mark_sent(self, items: Iterable[NewsItem]) -> None:
-        self._append_state_keys(items, self.sent_key_set, self.sent_keys)
+        self._append_state_keys(items, self.sent_key_set, self.sent_keys, "fingerprint")
         self._save_state()
 
     def run_once(self) -> None:
@@ -467,7 +526,7 @@ class MarketNewsBot:
         pulled_new_items = self.filter_unpulled_items(window_items)
         self.mark_pulled(pulled_new_items)
         to_model_items = self.filter_unmodeled_items(pulled_new_items)
-        deduped_for_model = dedupe_exact(to_model_items)
+        deduped_for_model = dedupe_by_topic(dedupe_exact(to_model_items))
 
         logger.info(
             "本轮统计: 原始抓取数=%s / 窗口过滤后数=%s / 待模型数=%s / 去重后数=%s",
@@ -482,7 +541,50 @@ class MarketNewsBot:
             return
 
         logger.info("本轮抓到 %s 条新快讯，开始总结并发送", len(deduped_for_model))
-        message = self.summarize_batch_v2(deduped_for_model)
+        message = self.summarize_batch_v3(deduped_for_model)
+        if not message:
+            logger.warning("模型未返回可发送内容，本轮跳过")
+            return
+
+        self.mark_modeled(deduped_for_model)
+        if self.safe_send_msg(message):
+            self.mark_sent(deduped_for_model)
+            logger.info("本轮发送完成")
+        else:
+            logger.error("本轮发送失败，未写入已发送状态")
+
+    def run_once_v2(self) -> None:
+        items = self.fetch_news()
+        raw_count = len(items)
+        window_items = self.filter_recent_window_items(items)
+        window_count = len(window_items)
+        pulled_new_items = self.filter_unpulled_items(window_items)
+        self.mark_pulled(pulled_new_items)
+        to_model_items = self.filter_unmodeled_items(pulled_new_items)
+        deduped_for_model = dedupe_exact(to_model_items)
+
+        logger.info(
+            "本轮统计: 原始抓取数=%s / 窗口过滤后数=%s / 未拉取数=%s / 待模型数=%s / 去重后数=%s",
+            raw_count,
+            window_count,
+            len(pulled_new_items),
+            len(to_model_items),
+            len(deduped_for_model),
+        )
+
+        if not deduped_for_model:
+            logger.info("最近 %s 分钟内无新快讯", LOOKBACK_MINUTES)
+            logger.info(
+                "无新快讯原因: 窗口内=%s / 未拉取=%s / 待模型=%s / 去重后=%s",
+                window_count,
+                len(pulled_new_items),
+                len(to_model_items),
+                len(deduped_for_model),
+            )
+            return
+
+        logger.info("本轮抓到 %s 条新快讯，开始总结并发送", len(deduped_for_model))
+        message = self.summarize_batch_v3(deduped_for_model)
         if not message:
             logger.warning("模型未返回可发送内容，本轮跳过")
             return
@@ -510,7 +612,7 @@ class MarketNewsBot:
 
         while True:
             try:
-                self.run_once()
+                    self.run_once_v2()
             except Exception as exc:
                 logger.exception("轮询执行异常: %s", exc)
             time.sleep(POLL_INTERVAL_SECONDS)
@@ -648,6 +750,20 @@ def dedupe_exact(items: list[NewsItem]) -> list[NewsItem]:
     return result
 
 
+def dedupe_by_topic(items: list[NewsItem]) -> list[NewsItem]:
+    seen_signatures: list[str] = []
+    result: list[NewsItem] = []
+    for item in items:
+        signature = topic_signature(item.content or item.title)
+        if not signature:
+            continue
+        if any(is_near_duplicate(signature, existing) for existing in seen_signatures):
+            continue
+        seen_signatures.append(signature)
+        result.append(item)
+    return result
+
+
 def canonicalize_news_text(title: str, content: str) -> str:
     text = clean_text(content or title or "")
     text = re.sub(r"^[【\[].*?[】\]]", "", text)
@@ -657,6 +773,15 @@ def canonicalize_news_text(title: str, content: str) -> str:
     text = re.sub(r"\s+", "", text)
     text = re.sub(r"[，,。；;：:！!？?\-—_、\"'“”‘’\[\]【】()（）]", "", text)
     return text.strip().lower()
+
+
+def topic_signature(text: str) -> str:
+    normalized = clean_text(text or "").lower()
+    normalized = re.sub(r"\d+(\.\d+)?%?", " ", normalized)
+    normalized = re.sub(r"(美元|元|盎司|桶|点|bp|亿元|万亿|etf)", " ", normalized)
+    normalized = re.sub(r"[^\w\u4e00-\u9fff]+", " ", normalized)
+    normalized = re.sub(r"\s+", "", normalized)
+    return normalized
 
 
 def is_near_duplicate(left: str, right: str) -> bool:
@@ -700,6 +825,132 @@ def normalize_summary_text(text: str) -> str:
     if not numbered:
         return ""
     return "\n".join(["市场热点", *numbered]).strip()
+
+
+def normalize_summary_text_v2(text: str) -> str:
+    if not text:
+        return ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    numbered = [line for line in lines if re.match(r"^\d+\.\s+", line)]
+    if not numbered:
+        return text.strip()
+
+    cleaned: list[str] = []
+    seen_signatures: list[str] = []
+    for line in numbered:
+        body = re.sub(r"^\d+\.\s*", "", line).strip()
+        if not body:
+            continue
+        if "已合并" in body or "重复" in body:
+            continue
+        signature = topic_signature(body)
+        if not signature:
+            continue
+        if any(is_near_duplicate(signature, existing) for existing in seen_signatures):
+            continue
+        seen_signatures.append(signature)
+        cleaned.append(body)
+
+    if not cleaned:
+        return ""
+    rebuilt = [f"{idx}. {body}" for idx, body in enumerate(cleaned, start=1)]
+    return "\n".join(["市场热点", *rebuilt]).strip()
+
+
+def build_summary_system_prompt() -> str:
+    return (
+        "你是市场资讯整理助手。"
+        "请对输入的快讯做语义去重、合并相同事件、压缩措辞，但绝不编造事实。"
+        "输出必须是简体中文纯文本，适合直接发微信群。"
+        "输出格式必须严格如下：\n"
+        "市场热点\n"
+        "1. 句子；\n"
+        "2. 句子；\n"
+        "...\n\n"
+        "要求：\n"
+        "1. 不要输出时间、信息源、标题、前言、结语、Markdown。\n"
+        "2. 每条只保留核心信息，写成一句话。\n"
+        "3. 重复或高度相似内容要合并。\n"
+        "4. 保持中文全角分号风格，最后一条可以不加分号。\n"
+        "5. 条数按有效热点数量决定，不要强行凑数。\n"
+        "6. 只基于输入内容总结，不能增加未出现的信息。"
+    )
+
+
+def build_summary_user_prompt(items: list[NewsItem]) -> str:
+    return json.dumps(
+        {
+            "target_count": len(items),
+            "instruction": f"请总结这批新闻，最多输出 {len(items)} 条，不要重复。",
+            "items": [item.to_prompt_dict() for item in items],
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def extract_numbered_bodies(text: str) -> list[str]:
+    result: list[str] = []
+    for line in text.splitlines():
+        match = re.match(r"^\s*\d+\.\s*(.+?)\s*$", line)
+        if match:
+            body = clean_text(match.group(1))
+            if body:
+                result.append(body)
+    return result
+
+
+def dedupe_summary_lines(lines: list[str]) -> list[str]:
+    result: list[str] = []
+    seen_signatures: list[str] = []
+    for line in lines:
+        signature = topic_signature(line)
+        if not signature:
+            continue
+        if any(is_near_duplicate(signature, existing) for existing in seen_signatures):
+            continue
+        seen_signatures.append(signature)
+        result.append(line)
+    return result
+
+
+def sanitize_wechat_message(text: str) -> str:
+    if not text:
+        return ""
+
+    normalized = unicodedata.normalize("NFKC", text).replace("\r\n", "\n").replace("\r", "\n")
+    cleaned_chars: list[str] = []
+    for char in normalized:
+        code = ord(char)
+        category = unicodedata.category(char)
+
+        if char in ("\n", "\t"):
+            cleaned_chars.append(char)
+            continue
+        if category.startswith("C"):
+            continue
+        if 0xD800 <= code <= 0xDFFF:
+            continue
+        if 0xE000 <= code <= 0xF8FF:
+            continue
+        if 0xFE00 <= code <= 0xFE0F:
+            continue
+        if 0xE0100 <= code <= 0xE01EF:
+            continue
+        if 0x200B <= code <= 0x200F:
+            continue
+        if 0x202A <= code <= 0x202E:
+            continue
+        if 0x2066 <= code <= 0x2069:
+            continue
+        if category == "So" and code > 0xFFFF:
+            continue
+        cleaned_chars.append(char)
+
+    sanitized = "".join(cleaned_chars)
+    sanitized = re.sub(r"[ \t]+\n", "\n", sanitized)
+    sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
+    return sanitized.strip()
 
 
 def strip_trailing_punctuation(text: str) -> str:
@@ -788,7 +1039,7 @@ def call_openai_chat(system_prompt: str, user_prompt: str) -> str:
                 url,
                 headers=headers,
                 json=payload,
-                timeout=OPENAI_TIMEOUT_SECONDS,
+                timeout=(OPENAI_CONNECT_TIMEOUT_SECONDS, OPENAI_READ_TIMEOUT_SECONDS),
                 proxies=proxies or None,
             )
             response.raise_for_status()
